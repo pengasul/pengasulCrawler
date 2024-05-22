@@ -8,79 +8,66 @@ import re
 import signal
 from urllib.parse import urljoin, urlparse
 from datetime import datetime
+import time
+from concurrent.futures import ThreadPoolExecutor
+import threading
+import json
 
-continue_crawling = True
+# Constants
 CUSTOM_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/98.0.4758.102 Safari/537.36 pengasulCrawler/1.0",
     "X-Contact": "Discord: veryharam"
 }
+CRAWL_DELAY = 1  # delay in seconds between requests
+NUM_THREADS = 5  # number of threads for multithreading
+TLD_LIST = ['.com', '.net', '.org']  # list of TLDs to use (.gov, .mil, .edu, etc were removed for better results)
+
+# Global variables
+continue_crawling = True
+lock = threading.Lock()
 
 def signal_handler(signal, frame):
     global continue_crawling
     print("Ctrl+C pressed. Stopping crawling...")
     continue_crawling = False
-    
+
 signal.signal(signal.SIGINT, signal_handler)
 
 def get_random_url():
     url_length = random.randint(6, 10)  # generated url length range
     letters = string.ascii_lowercase
     random_domain = ''.join(random.choice(letters) for _ in range(url_length))
-    return f"http://{random_domain}.com"
-
+    tld = random.choice(TLD_LIST)
+    return f"http://{random_domain}{tld}"
 
 def is_valid_url(url):
     parsed = urlparse(url)
     return bool(parsed.netloc) and bool(parsed.scheme)
 
-def log_findings(log_dir, url, content, ip_address, hostname, subdirectories, emails):
-    filename = re.sub(r'[^\w]', '_', hostname) + '.txt'
+def log_findings(log_dir, data):
+    filename = re.sub(r'[^\w]', '_', data['hostname']) + '.json'
     log_path = os.path.join(log_dir, filename)
-    
-    with open(log_path, 'w', encoding='utf-8') as log_file:
-        log_file.write(f"URL: {url}\n")
-        log_file.write(f"IP Address: {ip_address}\n")
-        log_file.write(f"Hostname: {hostname}\n")
-        log_file.write(f"Content Preview: {content[:100]}...\n\n")
-        log_file.write(f"Subdirectories:\n")
-        for subdir in subdirectories:
-            log_file.write(f"  {subdir}\n")
-        log_file.write(f"\nEmails:\n")
-        for email in emails:
-            log_file.write(f"  {email}\n")
 
+    with open(log_path, 'a', encoding='utf-8') as log_file:
+        json.dump(data, log_file, indent=4)
+        log_file.write('\n')
 
-def log_error(log_dir, error_message):
-    log_path = os.path.join(log_dir, 'error_log.txt')
-    with open(log_path, 'a') as log_file:
-        log_file.write(f"{error_message}\n")
+def log_error(log_dir, error_data):
+    log_path = os.path.join(log_dir, 'error_log.json')
+    with open(log_path, 'a', encoding='utf-8') as log_file:
+        json.dump(error_data, log_file, indent=4)
+        log_file.write('\n')
 
 def resolve_hostname(url):
     try:
         parsed_url = urlparse(url)
         hostname = parsed_url.hostname
-        
-        # resolving HTTPS
-        try:
-            ip_address = socket.gethostbyname(hostname)
-            requests.get(f"https://{hostname}")  # Test HTTPS connection
-            return ip_address, hostname, "https"
-        except:
-            pass
 
-        # if HTTPS fails try resolving HTTP
-        try:
-            ip_address = socket.gethostbyname(hostname)
-            requests.get(f"http://{hostname}")  # Test HTTP connection
-            return ip_address, hostname, "http"
-        except:
-            pass
-        
-        return None, None, None  # return None if both fail
+        ip_address = socket.gethostbyname(hostname)
+        return ip_address, hostname
     except socket.gaierror:
-        return None, None, None
-
+        return None, None
 
 def extract_emails(content):
     email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
@@ -95,72 +82,113 @@ def extract_subdirectories(url, soup):
             subdirectories.add(full_url)
     return list(subdirectories)
 
-def crawl(log_dir, url, max_depth, current_depth, visited):
+def keyword_analysis(content):
+    words = re.findall(r'\b\w+\b', content)
+    keyword_freq = {}
+    for word in words:
+        word = word.lower()
+        keyword_freq[word] = keyword_freq.get(word, 0) + 1
+    sorted_keywords = sorted(keyword_freq.items(), key=lambda item: item[1], reverse=True)
+    return [{"keyword": k, "frequency": v} for k, v in sorted_keywords[:10]]  # top 10 keywords
+
+def crawl(log_dir, url, max_depth, current_depth, visited, session):
     if not continue_crawling:
         return
-    
+
     if current_depth < 0 or url in visited:
         return
 
     try:
-        # resolve hostname and protocol
-        ip_address, hostname, protocol = resolve_hostname(url)
+        ip_address, hostname = resolve_hostname(url)
         if not ip_address or not hostname:
-            print(f"Failed to resolve {url}: Could not resolve hostname.")
+            error_data = {
+                "timestamp": str(datetime.now()),
+                "url": url,
+                "error": "Could not resolve hostname."
+            }
+            print(f"Error: {error_data['error']} for URL: {url}")
+            log_error(log_dir, error_data)
             return
 
-        # test the connection
-        test_url = f"{protocol}://{hostname}"
-        response = requests.get(test_url, headers=CUSTOM_HEADERS, timeout=3)
+        # attempt to fetch the URL using HTTPS
+        try:
+            response = session.get(f"https://{hostname}", headers=CUSTOM_HEADERS, timeout=3)
+            protocol = "https"
+        except requests.RequestException:
+            # if HTTPS fails fall back to HTTP
+            try:
+                response = session.get(f"http://{hostname}", headers=CUSTOM_HEADERS, timeout=3)
+                protocol = "http"
+            except requests.RequestException:
+                response = None
 
-        if response.status_code != 200:
-            print(f"Failed to fetch {url}: Status code {response.status_code}")
+        if response is None or response.status_code != 200:
+            error_data = {
+                "timestamp": str(datetime.now()),
+                "url": url,
+                "status_code": response.status_code if response else "N/A",
+                "error": "Failed to fetch URL."
+            }
+            print(f"Error: {error_data['error']} for URL: {url} with status code: {error_data['status_code']}")
+            log_error(log_dir, error_data)
             return
 
-        visited.add(url)
+        with lock:
+            visited.add(url)
         page_content = response.text
 
         soup = BeautifulSoup(page_content, 'html.parser')
         subdirectories = extract_subdirectories(url, soup)
         emails = extract_emails(page_content)
-        
-        # log the findings
-        log_findings(log_dir, url, page_content, ip_address, hostname, subdirectories, emails)
+        keywords = keyword_analysis(page_content)
 
-        # find all links on the page and continue crawling
+        data = {
+            "timestamp": str(datetime.now()),
+            "url": url,
+            "ip_address": ip_address,
+            "hostname": hostname,
+            "status_code": response.status_code,
+            "content_preview": page_content[:100] + "...",
+            "subdirectories": subdirectories,
+            "emails": emails,
+            "top_keywords": keywords
+        }
+
+        log_findings(log_dir, data)
+
         for subdir in subdirectories:
             if is_valid_url(subdir):
-                # decrement the current depth for the next level of crawling
                 next_depth = current_depth - 1
-                crawl(log_dir, subdir, max_depth, next_depth, visited)
+                time.sleep(CRAWL_DELAY)
+                crawl(log_dir, subdir, max_depth, next_depth, visited, session)
     except (requests.RequestException, socket.gaierror) as e:
-        error_message = f"Failed to fetch {url}: {e}"
-        print(error_message)
-        log_error(log_dir, error_message)
+        error_data = {
+            "timestamp": str(datetime.now()),
+            "url": url,
+            "error": str(e)
+        }
+        print(f"Error: {error_data['error']} for URL: {url}")
+        log_error(log_dir, error_data)
 
-def start_crawling(max_depth):
-    # create a directory for today's date
+def start_crawling(max_depth, url_pattern=None):
     today = datetime.now().strftime('%Y-%m-%d')
     log_dir = os.path.join(os.getcwd(), today)
     if not os.path.exists(log_dir):
         os.makedirs(log_dir)
 
-    # variables for tracking visited URLs
     visited = set()
-    
     global continue_crawling
 
-    while continue_crawling:  # continue crawling until the user stops the program
-        # generate a random URL
-        start_url = get_random_url()
-
-        # crawl the URL with the specified depth
-        crawl(log_dir, start_url, max_depth, max_depth, visited)
+    with requests.Session() as session, ThreadPoolExecutor(max_workers=NUM_THREADS) as executor:
+        while continue_crawling:
+            start_url = get_random_url() if not url_pattern else url_pattern
+            executor.submit(crawl, log_dir, start_url, max_depth, max_depth, visited, session)
 
 def main():
     depth = int(input("Enter max depth for random URL crawling: ").strip())
     max_depth = depth
-    start_crawling(depth)
+    url_pattern = input("Enter URL pattern (leave blank for random URLs): ").strip() or None
+    start_crawling(max_depth, url_pattern)
 
 if __name__ == "__main__":
     main()

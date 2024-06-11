@@ -12,6 +12,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 import threading
 import json
+import gc
 
 # Constants
 CUSTOM_HEADERS = {
@@ -20,8 +21,9 @@ CUSTOM_HEADERS = {
     "X-Contact": "Discord: veryharam"
 }
 CRAWL_DELAY = 1  # delay in seconds between requests
-NUM_THREADS = 5  # number of threads for multithreading
+NUM_THREADS = 100 # number of threads for multithreading
 TLD_LIST = ['.com', '.net', '.org']  # list of TLDs to use (.gov, .mil, .edu, etc were removed for better results)
+MAX_VISITED_URLS = 25000  # maximum number of URLs to keep in the visited set
 
 # Global variables
 continue_crawling = True
@@ -91,6 +93,26 @@ def keyword_analysis(content):
     sorted_keywords = sorted(keyword_freq.items(), key=lambda item: item[1], reverse=True)
     return [{"keyword": k, "frequency": v} for k, v in sorted_keywords[:10]]  # top 10 keywords
 
+def extract_title(soup):
+    title_tag = soup.find('title')
+    return title_tag.get_text() if title_tag else 'N/A'
+
+def extract_meta_description(soup):
+    meta_tag = soup.find('meta', attrs={'name': 'description'})
+    return meta_tag['content'] if meta_tag else 'N/A'
+
+def extract_image_count(soup):
+    return len(soup.find_all('img'))
+
+def extract_external_links(url, soup):
+    external_links = set()
+    for link in soup.find_all('a', href=True):
+        href = link.get('href')
+        full_url = urljoin(url, href)
+        if urlparse(full_url).netloc != urlparse(url).netloc:
+            external_links.add(full_url)
+    return list(external_links)
+
 def crawl(log_dir, url, max_depth, current_depth, visited, session):
     if not continue_crawling:
         return
@@ -110,6 +132,8 @@ def crawl(log_dir, url, max_depth, current_depth, visited, session):
             log_error(log_dir, error_data)
             return
 
+        start_time = time.time()
+        
         # attempt to fetch the URL using HTTPS
         try:
             response = session.get(f"https://{hostname}", headers=CUSTOM_HEADERS, timeout=3)
@@ -121,6 +145,8 @@ def crawl(log_dir, url, max_depth, current_depth, visited, session):
                 protocol = "http"
             except requests.RequestException:
                 response = None
+
+        response_time = time.time() - start_time
 
         if response is None or response.status_code != 200:
             error_data = {
@@ -134,13 +160,21 @@ def crawl(log_dir, url, max_depth, current_depth, visited, session):
             return
 
         with lock:
+            if len(visited) >= MAX_VISITED_URLS:
+                visited.pop()
             visited.add(url)
-        page_content = response.text
+
+        page_content = response.text[:5000]  # store only the first 5000 characters of the page
+        page_size = len(response.content)  # size of the page
 
         soup = BeautifulSoup(page_content, 'html.parser')
         subdirectories = extract_subdirectories(url, soup)
         emails = extract_emails(page_content)
         keywords = keyword_analysis(page_content)
+        title = extract_title(soup)
+        meta_description = extract_meta_description(soup)
+        image_count = extract_image_count(soup)
+        external_links = extract_external_links(url, soup)
 
         data = {
             "timestamp": str(datetime.now()),
@@ -148,13 +182,23 @@ def crawl(log_dir, url, max_depth, current_depth, visited, session):
             "ip_address": ip_address,
             "hostname": hostname,
             "status_code": response.status_code,
+            "response_time": response_time,
+            "page_size": page_size,
+            "title": title,
+            "meta_description": meta_description,
+            "image_count": image_count,
+            "external_links": external_links,
             "content_preview": page_content[:100] + "...",
             "subdirectories": subdirectories,
             "emails": emails,
-            "top_keywords": keywords
+            "top_keywords": keywords,
+            "headers": dict(response.headers)
         }
 
         log_findings(log_dir, data)
+
+        del soup  # free up memory
+        gc.collect()  # trigger garbage collection
 
         for subdir in subdirectories:
             if is_valid_url(subdir):
@@ -183,6 +227,8 @@ def start_crawling(max_depth, url_pattern=None):
         while continue_crawling:
             start_url = get_random_url() if not url_pattern else url_pattern
             executor.submit(crawl, log_dir, start_url, max_depth, max_depth, visited, session)
+            session.cookies.clear()  # clear session cookies to free up memory
+            gc.collect()  # trigger garbage collection
 
 def main():
     depth = int(input("Enter max depth for random URL crawling: ").strip())
